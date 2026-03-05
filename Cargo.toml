@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A local reverse proxy that records HTTP request/response pairs as NDJSON events"
 license = "MIT"
+repository = "https://github.com/Jeyor1337/logtape"
 
 [[bin]]
 name = "logtape"
