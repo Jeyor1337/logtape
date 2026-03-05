@@ -1,0 +1,1 @@
+{"v":"0.2","ts":"bad-ts","kind":"http","name":"http.server","trace_id":"xyz","span_id":"123","attrs":{"url.path":"/missing-method","server.duration_ms":10}}

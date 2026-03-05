@@ -1,0 +1,32 @@
+[package]
+name = "logtape"
+version = "0.1.0"
+edition = "2021"
+description = "A local reverse proxy that records HTTP request/response pairs as NDJSON events"
+license = "MIT"
+
+[[bin]]
+name = "logtape"
+path = "src/main.rs"
+
+[[example]]
+name = "upstream_demo"
+path = "examples/upstream_demo.rs"
+
+[dependencies]
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+hyper = { version = "0.14", features = ["full"] }
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+url = "2"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+reqwest = { version = "0.11", features = ["blocking"] }
+tempfile = "3"
