@@ -1,15 +1,15 @@
 use crate::event::Event;
 use base64::Engine;
+use hyper::client::HttpConnector;
 use hyper::header::HeaderMap;
 use hyper::service::{make_service_fn, service_fn};
 use hyper::{Body, Client, Request, Response, Server, StatusCode, Uri};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::{mpsc, Arc};
 
 pub struct TapConfig {
     pub listen: SocketAddr,
@@ -29,7 +29,8 @@ pub enum OutputTarget {
 
 struct ProxyState {
     config: TapConfig,
-    writer: Mutex<Box<dyn Write + Send>>,
+    client: Client<HttpConnector, Body>,
+    log_tx: mpsc::Sender<String>,
 }
 
 fn generate_hex(len: usize) -> String {
@@ -134,6 +135,25 @@ fn http_version_string(version: hyper::Version) -> String {
     }
 }
 
+fn bad_gateway_response() -> Response<Body> {
+    let mut response = Response::new(Body::from("Bad Gateway"));
+    *response.status_mut() = StatusCode::BAD_GATEWAY;
+    response
+}
+
+fn attach_proxy_error(event: &mut Event, message: String, body_max: usize) {
+    event.level = Some("error".to_string());
+    event.set_attr("error.type", Value::String("proxy_error".to_string()));
+    event.set_attr("error.message", Value::String(message));
+    event.set_attr(
+        "http.response.headers",
+        Value::Object(serde_json::Map::new()),
+    );
+    for (k, v) in body_attrs("http.response", b"", body_max) {
+        event.set_attr(&k, v);
+    }
+}
+
 async fn proxy_handler(
     req: Request<Body>,
     state: Arc<ProxyState>,
@@ -164,47 +184,6 @@ async fn proxy_handler(
     };
 
     let req_body_bytes = hyper::body::to_bytes(body).await.unwrap_or_default();
-    let req_body = req_body_bytes.to_vec();
-
-    let upstream_uri: Uri = format!(
-        "{}{}{}",
-        state.config.upstream.trim_end_matches('/'),
-        path,
-        query_raw
-            .as_ref()
-            .map(|q| format!("?{}", q))
-            .unwrap_or_default()
-    )
-    .parse()
-    .unwrap_or_else(|_| state.config.upstream.parse().expect("invalid upstream url"));
-
-    let traceparent_value = format!("00-{}-{}-01", trace_id, span_id);
-
-    let mut builder = Request::builder().method(method.clone()).uri(upstream_uri);
-    for (k, v) in &req_headers {
-        if k.as_str().eq_ignore_ascii_case("host") || k.as_str().eq_ignore_ascii_case("traceparent")
-        {
-            continue;
-        }
-        builder = builder.header(k, v);
-    }
-    builder = builder.header(
-        "traceparent",
-        hyper::header::HeaderValue::from_str(&traceparent_value).unwrap_or_else(|_| {
-            hyper::header::HeaderValue::from_static(
-                "00-00000000000000000000000000000000-0000000000000000-01",
-            )
-        }),
-    );
-
-    let upstream_req = builder
-        .body(Body::from(req_body.clone()))
-        .expect("build upstream req");
-
-    let client = Client::new();
-    let upstream_result = client.request(upstream_req).await;
-
-    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
 
     let mut event = Event::new_http(trace_id.clone(), span_id.clone());
     if let Some(ref svc) = state.config.service {
@@ -225,9 +204,74 @@ async fn proxy_handler(
         "http.request.headers",
         redact_headers(&req_headers, &state.config.redact_headers),
     );
-    for (k, v) in body_attrs("http.request", &req_body, state.config.body_max) {
+    for (k, v) in body_attrs("http.request", &req_body_bytes, state.config.body_max) {
         event.set_attr(&k, v);
     }
+
+    let upstream_uri: Uri = match format!(
+        "{}{}{}",
+        state.config.upstream.trim_end_matches('/'),
+        original_uri.path(),
+        query_raw
+            .as_ref()
+            .map(|q| format!("?{}", q))
+            .unwrap_or_default()
+    )
+    .parse()
+    {
+        Ok(uri) => uri,
+        Err(_) => match state.config.upstream.parse() {
+            Ok(uri) => uri,
+            Err(e) => {
+                attach_proxy_error(
+                    &mut event,
+                    format!("invalid upstream url: {}", e),
+                    state.config.body_max,
+                );
+                let elapsed = start.elapsed().as_secs_f64() * 1000.0;
+                event.set_attr(
+                    "server.duration_ms",
+                    Value::Number(
+                        serde_json::Number::from_f64(elapsed)
+                            .unwrap_or_else(|| serde_json::Number::from(0)),
+                    ),
+                );
+                if let Ok(line) = event.to_json_line() {
+                    let _ = state.log_tx.send(line);
+                }
+                return Ok(bad_gateway_response());
+            }
+        },
+    };
+
+    let traceparent_value = format!("00-{}-{}-01", trace_id, span_id);
+
+    let mut upstream_req = Request::new(Body::from(req_body_bytes.clone()));
+    *upstream_req.method_mut() = method;
+    *upstream_req.uri_mut() = upstream_uri;
+    {
+        let headers = upstream_req.headers_mut();
+        for (k, v) in &req_headers {
+            if k.as_str().eq_ignore_ascii_case("host")
+                || k.as_str().eq_ignore_ascii_case("traceparent")
+            {
+                continue;
+            }
+            headers.append(k.clone(), v.clone());
+        }
+        headers.insert(
+            "traceparent",
+            hyper::header::HeaderValue::from_str(&traceparent_value).unwrap_or_else(|_| {
+                hyper::header::HeaderValue::from_static(
+                    "00-00000000000000000000000000000000-0000000000000000-01",
+                )
+            }),
+        );
+    }
+
+    let upstream_result = state.client.request(upstream_req).await;
+
+    let elapsed = start.elapsed().as_secs_f64() * 1000.0;
     event.set_attr(
         "server.duration_ms",
         Value::Number(
@@ -242,46 +286,31 @@ async fn proxy_handler(
             let resp_body_bytes = hyper::body::to_bytes(resp.into_body())
                 .await
                 .unwrap_or_default();
-            let resp_body = resp_body_bytes.to_vec();
 
             event.set_attr("http.response.status_code", Value::Number(status.into()));
             event.set_attr(
                 "http.response.headers",
                 redact_headers(&resp_headers, &state.config.redact_headers),
             );
-            for (k, v) in body_attrs("http.response", &resp_body, state.config.body_max) {
+            for (k, v) in body_attrs("http.response", &resp_body_bytes, state.config.body_max) {
                 event.set_attr(&k, v);
             }
 
-            let mut rb =
-                Response::builder().status(StatusCode::from_u16(status).unwrap_or(StatusCode::OK));
+            let mut response = Response::new(Body::from(resp_body_bytes));
+            *response.status_mut() = StatusCode::from_u16(status).unwrap_or(StatusCode::OK);
             for (k, v) in &resp_headers {
-                rb = rb.header(k, v);
+                response.headers_mut().append(k.clone(), v.clone());
             }
-            rb.body(Body::from(resp_body)).expect("build response")
+            response
         }
         Err(err) => {
-            event.level = Some("error".to_string());
-            event.set_attr("error.type", Value::String("proxy_error".to_string()));
-            event.set_attr("error.message", Value::String(err.to_string()));
-            event.set_attr(
-                "http.response.headers",
-                Value::Object(serde_json::Map::new()),
-            );
-            for (k, v) in body_attrs("http.response", b"", state.config.body_max) {
-                event.set_attr(&k, v);
-            }
-            Response::builder()
-                .status(StatusCode::BAD_GATEWAY)
-                .body(Body::from("Bad Gateway"))
-                .expect("build error response")
+            attach_proxy_error(&mut event, err.to_string(), state.config.body_max);
+            bad_gateway_response()
         }
     };
 
     if let Ok(line) = event.to_json_line() {
-        let mut writer = state.writer.lock().await;
-        let _ = writeln!(writer, "{}", line);
-        let _ = writer.flush();
+        let _ = state.log_tx.send(line);
     }
 
     Ok(response)
@@ -301,9 +330,20 @@ pub async fn run(config: TapConfig) -> Result<(), Box<dyn std::error::Error + Se
         }
     };
 
+    let (log_tx, log_rx) = mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        let mut writer = BufWriter::new(writer);
+        while let Ok(line) = log_rx.recv() {
+            let _ = writeln!(writer, "{}", line);
+            let _ = writer.flush();
+        }
+        let _ = writer.flush();
+    });
+
     let state = Arc::new(ProxyState {
         config,
-        writer: Mutex::new(writer),
+        client: Client::new(),
+        log_tx,
     });
 
     let make_svc = make_service_fn(move |_conn| {
